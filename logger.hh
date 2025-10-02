@@ -5,7 +5,7 @@
 
 namespace log
 {
-    constexpr auto queue_length = 100;
+    constexpr auto queue_length = 1000;
 
     enum class severity : uint8_t
     {
