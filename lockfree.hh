@@ -13,23 +13,30 @@ namespace lockfree
         queue &operator=(const queue &) = delete;
         queue &operator=(const queue &&) = delete;
 
-        bool push(const T &val)
+        void push(const T &val)
         {
-            _queue[_head];
+            _queue[_head.load(std::memory_order_acquire)] = val;
             _head = (_head + 1) % size();
-            _len++;
+            _len.fetch_add(1, std::memory_order_relaxed);
         }
 
         bool pop(T &val)
         {
-            val = _queue[_tail];
+            if (_len == 0)
+            {
+                return false;
+            }
+
+            val = _queue[_tail.load(std::memory_order_release)];
             _tail = (_tail + 1) % size();
-            _len--;
+            _len.fetch_sub(1, std::memory_order_relaxed);
+
+            return true;
         }
 
         size_t len() const noexcept
         {
-            return _len.load();
+            return _len.load(std::memory_order_relaxed);
         }
 
         constexpr size_t size()
