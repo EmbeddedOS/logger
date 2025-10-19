@@ -58,9 +58,11 @@ namespace lockfree
                 return false;
             }
 
-            rc++;
             val = base::_queue[base::calculate_idx(rc)];
+            rc++;
+
             base::_read_counter.store(rc, std::memory_order_release);
+            return true;
         }
     };
 
@@ -77,7 +79,7 @@ namespace lockfree
         void push(const T &val)
         {
             auto idx = base::_write_counter.fetch_add(
-                1, std::memory_order_relaxed);
+                1, std::memory_order_release);
             base::_queue[base::calculate_idx(idx)] = val;
         }
 
