@@ -12,15 +12,18 @@
 #include <thread>
 #include <string>
 #include <vector>
+#include <array>
+#include <atomic>
 
 #include <iostream>
 
-#include <lockfree.hh>
+#include <logger.hh>
+#include <time.hh>
 
 namespace logger
 {
     const auto message_max_length = 512;
-    const size_t queue_length = {1 << 16}; // Power of two.
+    const size_t queue_length = {1 << 15}; // Power of two.
 
     enum class severity : uint8_t
     {
@@ -51,94 +54,31 @@ namespace logger
         default:
             break;
         }
-
         return "NONE";
     }
 
     struct alignas(lockfree::cache_line_size) message
     {
+        std::atomic_bool ready;
         uint8_t level;
         uint16_t len;
         timespec ts;
         char msg[message_max_length];
-        char _pad[lockfree::cache_line_size - (1 + 2 + sizeof(timespec) + message_max_length) % lockfree::cache_line_size];
+        char _pad[lockfree::cache_line_size -
+                  (sizeof(std::atomic_bool) + 1 + 2 + sizeof(timespec) + message_max_length) % lockfree::cache_line_size];
     };
-
-    inline timespec now_timespec() noexcept
-    { // Monotonic wrapper for COARSE realtime (fast on Linux).
-      // Fallback to REALTIME.
-        timespec ts{};
-#if defined(CLOCK_REALTIME_COARSE)
-        if (clock_gettime(CLOCK_REALTIME_COARSE, &ts) == 0)
-            return ts;
-#endif
-        clock_gettime(CLOCK_REALTIME, &ts);
-        return ts;
-    }
-
-    inline int
-    fmt_ts_yyyy_mm_dd_hh_mm_ss(const timespec &ts, char *dst) noexcept
-    {
-        time_t sec = ts.tv_sec;
-        struct tm tm{};
-        gmtime_r(&sec, &tm); // UTC.
-        // YYYY-MM-DD HH:MM:SS (19 chars).
-        int n = snprintf(dst, 20, "%04d-%02d-%02d %02d:%02d:%02d",
-                         tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-                         tm.tm_hour, tm.tm_min, tm.tm_sec);
-        return n; // should be 19.
-    }
-
-    static ssize_t writev_full(int fd, iovec *iov, int iovcnt) noexcept
-    { // returns total bytes written, or -1 on unrecoverable error (errno preserved)
-        ssize_t total_written = 0;
-        while (iovcnt > 0)
-        {
-            ssize_t n = ::writev(fd, iov, iovcnt);
-            if (n < 0)
-            {
-                if (errno == EINTR)
-                    continue;
-                if (errno == EAGAIN || errno == EWOULDBLOCK)
-                    break; // caller handles retry/pending
-                return -1; // unrecoverable
-            }
-            total_written += n;
-            // consume fully-written iovecs
-            int i = 0;
-            while (i < iovcnt && n >= static_cast<ssize_t>(iov[i].iov_len))
-            {
-                n -= static_cast<ssize_t>(iov[i].iov_len);
-                ++i;
-            }
-            if (i > 0)
-            {
-                int remaining = iovcnt - i;
-                if (remaining > 0)
-                    std::memmove(iov, iov + i, sizeof(iovec) * remaining);
-                iovcnt = remaining;
-            }
-            if (n > 0 && iovcnt > 0)
-            {
-                // partial write into iov[0]
-                iov[0].iov_base = static_cast<char *>(iov[0].iov_base) + n;
-                iov[0].iov_len = static_cast<size_t>(iov[0].iov_len) - static_cast<size_t>(n);
-            }
-        }
-        return total_written;
-    }
 
     struct logger_options
     {
         severity min_level{severity::trace};
         std::string output_file;
-        size_t batch_write{256}; // Max message per write.
+        size_t batch_write{512}; // Max message per write.
         // Adding more options here to expand the logger features, for example:
         // logging into remote server, config storage, flush, etc.
         // For now we only log to file.
     };
 
-    class logger
+    class logger : lockfree::queue<message, queue_length>
     {
     public:
         logger(const logger_options &opt)
@@ -158,20 +98,29 @@ namespace logger
             }
         }
 
-        void log(severity lv, const char *fmt, ...)
+        bool log(severity lv, const char *fmt, ...)
         {
             if (lv < _opts.min_level)
             {
-                return;
+                return false;
             }
 
-            int len = 0;
-            struct message m = {.level = static_cast<uint8_t>(lv),
-                                .ts = now_timespec()};
+            auto idx = base::_write_counter.fetch_add(
+                1, std::memory_order_relaxed);
+            message &slot = base::_queue[base::calculate_idx(idx)];
 
+            if (slot.ready.load(std::memory_order_acquire))
+            { // Full of ready slot.
+                return false;
+            }
+
+            slot.level = static_cast<uint8_t>(lv);
+            slot.ts = now_timespec();
+
+            int len = 0;
             va_list ap;
             va_start(ap, fmt);
-            len = vsnprintf(m.msg, message_max_length, fmt, ap);
+            len = vsnprintf(slot.msg, message_max_length, fmt, ap);
             va_end(ap);
 
             if (len < 0)
@@ -182,11 +131,13 @@ namespace logger
             if (len >= static_cast<int>(message_max_length))
             {
                 len = message_max_length - 1; // ensure space for eob.
-                m.msg[len] = '\0';
+                slot.msg[len] = '\0';
             }
 
-            m.len = static_cast<uint16_t>(len);
-            _queue.push(m);
+            slot.len = static_cast<uint16_t>(len);
+            slot.ready.store(true, std::memory_order_release);
+
+            return true;
         }
 
         void stop() noexcept
@@ -196,24 +147,26 @@ namespace logger
 
         void consume() noexcept
         {
+            std::this_thread::sleep_for(std::chrono::microseconds(500));
             std::vector<iovec> vec;
-            std::vector<std::array<char, lockfree::cache_line_size>> hdrs;
+            std::vector<std::array<char, 30>> hdrs;
 
             vec.reserve(_opts.batch_write);
             hdrs.reserve(_opts.batch_write);
 
-            struct message mess{};
-
             while (_running)
             {
                 size_t drained = 0;
+                auto rc = base::_read_counter.load(std::memory_order_relaxed);
                 vec.clear();
                 hdrs.clear();
 
                 for (; drained < _opts.batch_write; drained++)
                 { // Read all possible until max batch or no more to read.
-                    if (!_queue.try_pop(mess))
-                    {
+                    message &m = base::_queue[base::calculate_idx(rc)];
+
+                    if (!m.ready.load(std::memory_order_acquire))
+                    { // No more ready slot.
                         break;
                     }
 
@@ -235,7 +188,7 @@ namespace logger
                                    .iov_len = static_cast<size_t>(off)});
                     vec.push_back({.iov_base = mess.msg,
                                    .iov_len = static_cast<size_t>(mess.len)});
-                    std::cout << hdr.data() << mess.msg;
+                    std::cout << hdr.data() << ", len: " << mess.len << ", " << mess.msg;
                 }
 
                 if (!vec.empty())
@@ -276,7 +229,6 @@ namespace logger
         }
 
     private:
-        lockfree::mpsc_queue<message, queue_length> _queue;
         std::atomic_bool _running;
         logger_options _opts;
         std::thread _consumer;
