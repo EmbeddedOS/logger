@@ -17,12 +17,13 @@
 
 #include <iostream>
 
-#include <logger.hh>
+#include <lockfree.hh>
 #include <time.hh>
 
 namespace logger
 {
     const auto message_max_length = 512;
+    const auto header_max_length = 60;
     const size_t queue_length = {1 << 15}; // Power of two.
 
     enum class severity : uint8_t
@@ -59,26 +60,25 @@ namespace logger
 
     struct alignas(lockfree::cache_line_size) message
     {
-        std::atomic_bool ready;
         uint8_t level;
         uint16_t len;
         timespec ts;
         char msg[message_max_length];
         char _pad[lockfree::cache_line_size -
-                  (sizeof(std::atomic_bool) + 1 + 2 + sizeof(timespec) + message_max_length) % lockfree::cache_line_size];
+                  (1 + 2 + sizeof(timespec) + message_max_length) % lockfree::cache_line_size];
     };
 
     struct logger_options
     {
         severity min_level{severity::trace};
         std::string output_file;
-        size_t batch_write{512}; // Max message per write.
+        size_t batch_write{512}; // Max message cache per write.
         // Adding more options here to expand the logger features, for example:
         // logging into remote server, config storage, flush, etc.
         // For now we only log to file.
     };
 
-    class logger : lockfree::queue<message, queue_length>
+    class logger
     {
     public:
         logger(const logger_options &opt)
@@ -105,17 +105,8 @@ namespace logger
                 return false;
             }
 
-            auto idx = base::_write_counter.fetch_add(
-                1, std::memory_order_relaxed);
-            message &slot = base::_queue[base::calculate_idx(idx)];
-
-            if (slot.ready.load(std::memory_order_acquire))
-            { // Full of ready slot.
-                return false;
-            }
-
-            slot.level = static_cast<uint8_t>(lv);
-            slot.ts = now_timespec();
+            message slot {.level = static_cast<uint8_t>(lv),
+                          .ts = now_timespec()};
 
             int len = 0;
             va_list ap;
@@ -129,13 +120,13 @@ namespace logger
             }
 
             if (len >= static_cast<int>(message_max_length))
-            {
-                len = message_max_length - 1; // ensure space for eob.
+            {// ensure space for eob.
+                len = message_max_length - 1;
                 slot.msg[len] = '\0';
             }
 
             slot.len = static_cast<uint16_t>(len);
-            slot.ready.store(true, std::memory_order_release);
+            _queue.push(slot);
 
             return true;
         }
@@ -147,57 +138,40 @@ namespace logger
 
         void consume() noexcept
         {
-            std::this_thread::sleep_for(std::chrono::microseconds(500));
             std::vector<iovec> vec;
-            std::vector<std::array<char, 30>> hdrs;
-
+            std::vector<std::array<char, message_max_length + header_max_length>> buffer;
             vec.reserve(_opts.batch_write);
-            hdrs.reserve(_opts.batch_write);
+            buffer.reserve(_opts.batch_write);
 
             while (_running)
             {
-                size_t drained = 0;
-                auto rc = base::_read_counter.load(std::memory_order_relaxed);
                 vec.clear();
-                hdrs.clear();
+                buffer.clear();
 
-                for (; drained < _opts.batch_write; drained++)
-                { // Read all possible until max batch or no more to read.
-                    message &m = base::_queue[base::calculate_idx(rc)];
-
-                    if (!m.ready.load(std::memory_order_acquire))
-                    { // No more ready slot.
+                for (int idx = 0; idx < _opts.batch_write; idx++)
+                {
+                    message m{};
+                    if (!_queue.try_pop(m))
+                    {
                         break;
                     }
 
-                    // Build header: timestamp + level + message.
-                    hdrs.emplace_back();
-                    auto &hdr = hdrs.back();
-                    int off = 0;
-
-                    off += fmt_ts_yyyy_mm_dd_hh_mm_ss(mess.ts, hdr.data());
-                    hdr[off++] = ' ';
-                    const char *lv = severity_str(static_cast<severity>(mess.level));
-                    std::memcpy(hdr.data() + off, lv, 5);
+                    size_t off = fmt_ts_yyyy_mm_dd_hh_mm_ss(m.ts, buffer[idx].data());
+                    buffer[idx][off++] = ' ';
+                    const char *lv = severity_str(static_cast<severity>(m.level));
+                    std::memcpy(buffer[idx].data() + off, lv, 5);
                     off += 5;
-                    hdr[off++] = ' ';
-                    hdr[off++] = '-';
-                    hdr[off++] = ' ';
-
-                    vec.push_back({.iov_base = hdr.data(),
-                                   .iov_len = static_cast<size_t>(off)});
-                    vec.push_back({.iov_base = mess.msg,
-                                   .iov_len = static_cast<size_t>(mess.len)});
-                    std::cout << hdr.data() << ", len: " << mess.len << ", " << mess.msg;
+                    buffer[idx][off++] = ' ';
+                    buffer[idx][off++] = '-';
+                    buffer[idx][off++] = ' ';
+                    std::memcpy(buffer[idx].data() + off, m.msg, m.len);
+                    off += m.len;
+                    vec.push_back({.iov_base = buffer[idx].data(), .iov_len = off});
                 }
 
                 if (!vec.empty())
-                { // Log the buffer.
-                    int res = writev_full(_fd, vec.data(), static_cast<int>(vec.size()));
-                    if (vec.size() != res)
-                    {
-                        std::cerr << "err: " << res << " " << vec.size() << "\n";
-                    }
+                {
+                    writev(_fd, vec.data(), static_cast<int>(vec.size()));
                 }
                 else
                 {
@@ -207,7 +181,7 @@ namespace logger
         }
 
         void init_consumer()
-        { // TODO expand more logger features here.
+        { // TODO: expand more logger features here.
             if (_opts.output_file == "stdout")
             {
                 _fd = STDOUT_FILENO;
@@ -229,6 +203,7 @@ namespace logger
         }
 
     private:
+        lockfree::mpsc_queue<message, queue_length> _queue;
         std::atomic_bool _running;
         logger_options _opts;
         std::thread _consumer;

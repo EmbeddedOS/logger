@@ -50,8 +50,8 @@ namespace lockfree
         }
 
         bool try_pop(T &val)
-        { // Since there's only one consumer, this function suppose to run on
-          // only one thread.
+        { // Since there's only one consumer, this function supposes to be run
+          // only on one thread.
             auto rc = base::_read_counter.load(std::memory_order_relaxed);
             if (rc == base::_write_counter.load(std::memory_order_relaxed))
             {
