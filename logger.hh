@@ -146,12 +146,7 @@ namespace logger
             while (_running)
             {
                 vec.clear();
-                
-                // Ensure buffer has enough elements (resize creates elements, reserve only allocates)
-                if (buffer.size() < _opts.batch_write)
-                {
-                    buffer.resize(_opts.batch_write);
-                }
+                buffer.clear();
 
                 for (int idx = 0; idx < _opts.batch_write; idx++)
                 {
@@ -161,17 +156,18 @@ namespace logger
                         break;
                     }
 
-                    size_t off = fmt_ts_yyyy_mm_dd_hh_mm_ss(m.ts, buffer[idx].data());
-                    buffer[idx][off++] = ' ';
+                    auto buf = buffer.emplace_back();
+                    size_t off = fmt_ts_yyyy_mm_dd_hh_mm_ss(m.ts, buf.data());
+                    buf[off++] = ' ';
                     const char *lv = severity_str(static_cast<severity>(m.level));
-                    std::memcpy(buffer[idx].data() + off, lv, 5);
+                    std::memcpy(buf.data() + off, lv, 5);
                     off += 5;
-                    buffer[idx][off++] = ' ';
-                    buffer[idx][off++] = '-';
-                    buffer[idx][off++] = ' ';
-                    std::memcpy(buffer[idx].data() + off, m.msg, m.len);
+                    buf[off++] = ' ';
+                    buf[off++] = '-';
+                    buf[off++] = ' ';
+                    std::memcpy(buf.data() + off, m.msg, m.len);
                     off += m.len;
-                    vec.push_back({.iov_base = buffer[idx].data(), .iov_len = off});
+                    vec.push_back({.iov_base = buf.data(), .iov_len = off});
                 }
 
                 if (!vec.empty())

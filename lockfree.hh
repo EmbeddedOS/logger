@@ -22,6 +22,7 @@ namespace lockfree
                 _sequence[i].store(i, std::memory_order_relaxed);
             }
         }
+
         queue(const queue &) = delete;
         queue(const queue &&) = delete;
         queue &operator=(const queue &) = delete;

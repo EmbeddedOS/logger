@@ -11,13 +11,13 @@ int main()
     {
         const int threads = 8;
         const int per_thread = 10000; // 10k each -> 80K lines.
-        
+
         // Synchronization using condition variable (compatible with older GCC)
         std::mutex sync_mutex;
         std::condition_variable sync_cv;
         int ready_count = 0;
         bool start = false;
-        
+
         std::vector<std::thread> v;
         v.reserve(threads);
         for (int t = 0; t < threads; ++t)
@@ -40,10 +40,12 @@ int main()
                 logger::global_logger::get().log(logger::severity::info, "hello %d from worker %p\n", i, (void*)pthread_self());
             } });
         }
-        
+
         // Join all threads before they go out of scope
-        for (auto& thread : v) {
-            if (thread.joinable()) {
+        for (auto &thread : v)
+        {
+            if (thread.joinable())
+            {
                 thread.join();
             }
         }
