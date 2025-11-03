@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include <assert.h>
 #include <sys/uio.h>
+#include <unistd.h>
 
 #include <cstdarg>
 #include <cstring>
@@ -18,7 +19,6 @@
 #include <iostream>
 
 #include <lockfree.hh>
-#include <time.hh>
 
 namespace logger
 {
@@ -56,6 +56,31 @@ namespace logger
             break;
         }
         return "NONE";
+    }
+
+    inline timespec now_timespec() noexcept
+    { // Monotonic wrapper for COARSE realtime (fast on Linux).
+      // Fallback to REALTIME.
+        timespec ts{};
+#if defined(CLOCK_REALTIME_COARSE)
+        if (clock_gettime(CLOCK_REALTIME_COARSE, &ts) == 0)
+            return ts;
+#endif
+        clock_gettime(CLOCK_REALTIME, &ts);
+        return ts;
+    }
+
+    inline int
+    fmt_ts_yyyy_mm_dd_hh_mm_ss(const timespec &ts, char *dst) noexcept
+    {
+        time_t sec = ts.tv_sec;
+        struct tm tm{};
+        gmtime_r(&sec, &tm); // UTC.
+        // YYYY-MM-DD HH:MM:SS (19 chars).
+        int n = snprintf(dst, 20, "%04d-%02d-%02d %02d:%02d:%02d",
+                         tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+                         tm.tm_hour, tm.tm_min, tm.tm_sec);
+        return n; // should be 19.
     }
 
     struct alignas(lockfree::cache_line_size) message
@@ -105,8 +130,8 @@ namespace logger
                 return false;
             }
 
-            message slot {.level = static_cast<uint8_t>(lv),
-                          .ts = now_timespec()};
+            message slot{.level = static_cast<uint8_t>(lv),
+                         .ts = now_timespec()};
 
             int len = 0;
             va_list ap;
@@ -120,7 +145,7 @@ namespace logger
             }
 
             if (len >= static_cast<int>(message_max_length))
-            {// ensure space for eob.
+            { // Ensure space for eob.
                 len = message_max_length - 1;
                 slot.msg[len] = '\0';
             }
@@ -140,13 +165,11 @@ namespace logger
         {
             std::vector<iovec> vec;
             std::vector<std::array<char, message_max_length + header_max_length>> buffer;
-            vec.reserve(_opts.batch_write);
             buffer.reserve(_opts.batch_write);
 
             while (_running)
             {
                 vec.clear();
-                buffer.clear();
 
                 for (int idx = 0; idx < _opts.batch_write; idx++)
                 {
@@ -156,18 +179,19 @@ namespace logger
                         break;
                     }
 
-                    auto buf = buffer.emplace_back();
-                    size_t off = fmt_ts_yyyy_mm_dd_hh_mm_ss(m.ts, buf.data());
-                    buf[off++] = ' ';
+                    std::memset(buffer[idx].data(), 0, sizeof(buffer[0]));
+
+                    size_t off = fmt_ts_yyyy_mm_dd_hh_mm_ss(m.ts, buffer[idx].data());
+                    buffer[idx][off++] = ' ';
                     const char *lv = severity_str(static_cast<severity>(m.level));
-                    std::memcpy(buf.data() + off, lv, 5);
+                    std::memcpy(buffer[idx].data() + off, lv, 5);
                     off += 5;
-                    buf[off++] = ' ';
-                    buf[off++] = '-';
-                    buf[off++] = ' ';
-                    std::memcpy(buf.data() + off, m.msg, m.len);
+                    buffer[idx][off++] = ' ';
+                    buffer[idx][off++] = '-';
+                    buffer[idx][off++] = ' ';
+                    std::memcpy(buffer[idx].data() + off, m.msg, m.len);
                     off += m.len;
-                    vec.push_back({.iov_base = buf.data(), .iov_len = off});
+                    vec.push_back({.iov_base = buffer[idx].data(), .iov_len = off});
                 }
 
                 if (!vec.empty())

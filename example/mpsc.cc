@@ -6,7 +6,7 @@
 
 int main()
 {
-    logger::logger_options opts{.output_file = "./test.txt"};
+    logger::logger_options opts{.output_file = "stderr"};
     logger::global_logger::init(opts);
     {
         const int threads = 8;
