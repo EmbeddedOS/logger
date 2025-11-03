@@ -146,7 +146,12 @@ namespace logger
             while (_running)
             {
                 vec.clear();
-                buffer.clear();
+                
+                // Ensure buffer has enough elements (resize creates elements, reserve only allocates)
+                if (buffer.size() < _opts.batch_write)
+                {
+                    buffer.resize(_opts.batch_write);
+                }
 
                 for (int idx = 0; idx < _opts.batch_write; idx++)
                 {
