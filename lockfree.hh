@@ -16,7 +16,7 @@ namespace lockfree
 
         queue()
         {
-            // Initialize all sequence numbers
+            // Initialize all sequence numbers.
             for (size_t i = 0; i < N; ++i)
             {
                 _sequence[i].store(i, std::memory_order_relaxed);
@@ -45,13 +45,14 @@ namespace lockfree
 
         alignas(cache_line_size) std::array<T, N> _queue;
         
-        // Sequence numbers to track which slots are ready to read
+        // Sequence numbers to track which slots are ready to read.
         std::array<std::atomic<size_t>, N> _sequence;
     };
 
     template <typename T, std::size_t N>
     struct mpsc_queue : queue<T, N>
     { // Mutiple producers - single consumer.
+      // TODO: implement sequence numbers to track which slots are ready to read.
         using base = queue<T, N>;
         void push(const T &val)
         {
